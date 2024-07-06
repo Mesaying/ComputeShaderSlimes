@@ -1,0 +1,182 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Update
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+uint width;
+uint height;
+
+float deltaTime;
+float time;
+uint numAgents;
+
+float PI = 3.14159265359;
+
+float moveSpeed;
+
+float sensorOffsetDst;
+
+uint hash(uint state) 
+{
+    state ^= 2747636419u;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    return state;
+}
+
+float scaleToRange01(uint state)
+{
+    return state / 4294967295.0;
+}
+
+struct Agent {
+    float2 position;
+    float angle;
+};
+
+RWStructuredBuffer<Agent> agents;
+RWTexture2D<float4> TrailMap;
+
+int sensorSize;
+float sensorAngleSpacing;
+
+float sense(Agent agent, float sensorAngleOffset) 
+{
+    float sensorAngle = agent.angle + sensorAngleOffset;
+    float2 sensorDir = float2(cos(sensorAngle), sin(sensorAngle));
+
+    float2 sensorPos = agent.position + sensorDir * sensorOffsetDst;
+    int sensorCentreX = (int)sensorPos.x;
+    int sensorCentreY = (int)sensorPos.y;
+
+    float sum = 0;
+
+    //sensor size kommt da rein
+    for (int offsetX = -sensorSize; offsetX <= sensorSize; offsetX++)
+    {
+        for (int offsetY = -sensorSize; offsetY <= sensorSize; offsetY++)
+        {
+            //int2 pos = sensorCentre + int2(offsetX, offsetY);
+
+            int sampleX = min(width - 1, max(0, sensorCentreX + offsetX));
+            int sampleY = min(height - 1, max(0, sensorCentreY + offsetY));
+            
+            sum += TrailMap[int2(sampleX,sampleY)].x;
+        }
+    }
+    
+    return sum;
+}
+
+
+float turnSpeed;
+
+[numthreads(16,1,1)]
+void Update(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numAgents) {
+        return;
+    }
+
+    Agent agent = agents[id.x];
+    uint random = hash(agent.position.y * width + agent.position.x + hash(id.x + time * 100000));
+
+    float weightForward = sense(agent, 0);
+    float weightLeft = sense(agent, -sensorAngleSpacing);
+    float weightRight = sense(agent, sensorAngleSpacing);
+
+    float randomSteerStrength = scaleToRange01(random);
+
+    //dont turn
+    if (weightForward > weightLeft && weightForward > weightRight) {
+        agent.angle += 0;
+    }
+    //Turn random
+    else if (weightForward < weightLeft && weightForward < weightRight)
+    {
+        agent.angle += (randomSteerStrength - 0.5) * 2 * turnSpeed * deltaTime;
+    }
+    //turn right
+    else if (weightRight > weightLeft)
+    {
+        agent.angle -= randomSteerStrength * turnSpeed * deltaTime;
+    }
+    //turn left
+    else if (weightLeft > weightRight) {
+        agents[id.x].angle += randomSteerStrength * turnSpeed * deltaTime;
+    }
+
+    
+
+    
+
+    float2 dir = float2(cos(agent.angle), sin(agent.angle));
+
+
+    float2 newPos = agent.position + (dir * moveSpeed * deltaTime);
+
+    if (newPos.x < 0 || newPos.x >= width || newPos.y < 0 || newPos.y >= height)
+    {
+        random = hash(random);
+        float randomAngle = scaleToRange01(random) * 2 * 3.1415;
+
+        newPos.x = min(width - 1, max(0, newPos.x));
+        newPos.y = min(height - 1, max(0, newPos.y));
+        agents[id.x].angle = randomAngle;
+    }
+    else
+    {
+        agents[id.x].position = newPos;
+        TrailMap[int2(newPos.x, newPos.y)] = 1;
+        //TrailMap[uint2(44, 44)] = 1;
+    }
+    
+
+}
+
+#pragma kernel ProcessTrailMap
+
+RWTexture2D<float4> ProcessedTrailMap;
+float evaporateSpeed;
+float diffuseSpeed;
+
+    [numthreads(8, 8, 1)]
+    void ProcessTrailMap(uint3 id : SV_DispatchThreadID)
+    {
+        if (id.x < 0 || id.x >= width || id.y < 0 || id.y >= height)
+        {
+            return;
+        }
+                
+        float4 ogVal = TrailMap[id.xy];
+
+        float4 evaporatedValue = max(0, ogVal - evaporateSpeed * deltaTime);
+        
+        float4 sum = 0;
+        for (int offsetX = -1; offsetX <= 1; offsetX++) 
+        {
+            for (int offsetY = -1; offsetY <= 1; offsetY++) 
+            {
+                int sampleX = id.x + offsetX;
+                int sampleY = id.y + offsetY;
+
+                if (sampleX >= 0 && sampleX < width && sampleY >= 0 && sampleY < height) 
+                {
+                    sum += TrailMap[int2(sampleX, sampleY)];
+                }
+            }
+        }
+
+        float4 blurResult = sum / 9;
+
+        float4 diffusedValue = lerp(ogVal, blurResult, diffuseSpeed * deltaTime);
+        float4 diffusedAndEvaporate = min(1 , max(0, diffusedValue - evaporateSpeed * deltaTime));
+        
+
+        ProcessedTrailMap[id.xy] = diffusedAndEvaporate;
+    }
+
+
